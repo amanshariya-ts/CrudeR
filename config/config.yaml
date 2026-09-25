@@ -23,8 +23,8 @@ strategies:
 
 alerts:
   telegram:
-    bot_token: "8836956846:AAFL5BEINJ3VhgLc_I4UoSLIj_By1s8Iy9k"
-    chat_id: "1048733397"
+    bot_token: ""
+    chat_id: ""
 
 polling:
   interval_seconds: 5
