@@ -1,5 +1,5 @@
 fyers:
-  app_id: "B87U7R9BRA-200"
+  app_id: "M2PYM6MWK1-100"
   access_token_file: "access_token.txt"   # auto-refresh writes here
 
 markets:
