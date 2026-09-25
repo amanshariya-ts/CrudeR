@@ -4,8 +4,17 @@ fyers:
 
 markets:
   - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
+    timeframe: "1m"
+    exchange: "fyers"  
+  - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
+    timeframe: "3m"
+    exchange: "fyers" 
+  - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
+    timeframe: "5m"
+    exchange: "fyers" 
+  - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
     timeframe: "30m"
-    exchange: "fyers"                 # was "yf_oil"
+    exchange: "fyers" 
   - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
     timeframe: "1h"
     exchange: "fyers" 
