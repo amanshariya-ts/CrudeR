@@ -1,0 +1,16 @@
+from fyers_apiv3 import fyersModel
+
+app_id = "B87U7R9BRA-200"
+access_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcXRoZU1TRDFGM0RPbXdSbnFGRXo2ZlBmNkE2bjJyYW1MSktTaEt5Y0pyeWxQWFJocWd0TmNjVG9Vb3pSaWhSSlNwZ010YjNsa0h3aEd6dkkxOVZjOWx5RXI2TjZCUk5yOFNfSDZibG9Fb1RGNElIWT0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiI3YTUwYzE3ZGFlZWQ5Zjc4OTA5OTM2NGY4YjU4YWY1NTIwNzA3N2UwOGFiYmYwODllOTMwNmMxMiIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWUExNTMyNSIsImFwcFR5cGUiOjIwMCwiZXhwIjoxNzkwMzgyNjAwLCJpYXQiOjE3OTAzMTg0NzYsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc5MDMxODQ3Niwic3ViIjoiYWNjZXNzX3Rva2VuIn0.882aRuYjpUc6eE_cUXS7_Ye0va1YMxy40JF0Nx9keh8"
+
+fyers = fyersModel.FyersModel(
+    client_id=app_id,
+    is_async=False,
+    token=access_token,
+    log_path=""
+)
+
+print(fyers.get_profile())
+
+quote = fyers.quotes({"symbols": "NSE:CRUDEOIL26OCTFUT"})  # adjust symbol if needed
+print(quote)
