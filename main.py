@@ -1,13 +1,15 @@
 # main.py
 import os
+import sys
 import time
 import logging
 import threading
+from datetime import datetime, timezone, timedelta
 
 from config.config_loader import load_config
 from data.fetcher import create_fetcher
 from data.candle_poller import CandlePoller
-from data.fyers_fetcher import TokenExpiredError   # <-- FIX IF NEEDED: match your fetcher module
+from data.fyers_fetcher import TokenExpiredError
 from strategies.liquidity_pinbars import LiquidityPinBars
 from alerts.telegram import TelegramAlert
 from state.state_store import StateStore
@@ -15,6 +17,30 @@ from state.state_store import StateStore
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("framework")
+
+# ---------------------------------------------------------------------------
+# Runtime controls
+# ---------------------------------------------------------------------------
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Max hours this process may run before self-exiting.
+# GitHub Actions kills jobs at 6h -> we exit at 5.5h for clean teardown.
+# Set MAX_RUNTIME_HOURS=0 to disable (e.g., running locally all day).
+MAX_RUNTIME_HOURS = float(os.environ.get("MAX_RUNTIME_HOURS", "5.5"))
+
+# MCX trading window (IST): 09:00 - 23:30
+MCX_START_HOUR = 9
+MCX_END_HOUR = 23
+MCX_END_MINUTE = 30
+
+
+def in_mcx_hours(now=None):
+    """True if we're inside the MCX trading session (IST)."""
+    now = now or datetime.now(IST)
+    if MCX_START_HOUR <= now.hour < MCX_END_HOUR:
+        return True
+    return now.hour == MCX_END_HOUR and now.minute < MCX_END_MINUTE
+
 
 STRATEGY_REGISTRY = {
     LiquidityPinBars.name: LiquidityPinBars,
@@ -69,14 +95,55 @@ def run_market(cfg, tg, state, symbol, timeframe, exchange_name):
 
     except TokenExpiredError:
         # Shared Fyers token — when it dies, every market thread is doomed.
-        # Hard-exit so the operator sees the process is down, not a silent zombie.
+        # Hard-exit so the operator (or Actions log) sees the process is down.
         log.critical(f"[{symbol}] Fyers token expired — shutting down. "
-                     f"Run refresh_token.py, then restart the bot.")
+                     f"Refresh the token, then restart the bot.")
         os._exit(1)
+
+
+def evaluate_once(cfg, tg, state):
+    """Single evaluation pass over all markets — used by --once mode.
+    Fetches each market's latest candles, drops the forming candle,
+    and evaluates strategies exactly like the loop path does."""
+    for market in cfg["markets"]:
+        symbol = market["symbol"]
+        timeframe = market["timeframe"]
+        default_exchange = cfg.get("exchange", {}).get("name", "fyers")
+        exchange_name = market.get("exchange", default_exchange)
+
+        try:
+            fetcher = create_fetcher(exchange_name, cfg)
+            df = fetcher.fetch_ohlcv(symbol, timeframe,
+                                     cfg["polling"]["lookback_bars"])
+            closed_df = df.iloc[:-1]
+            for strat in build_strategies(symbol, timeframe, cfg["strategies"]):
+                signal = strat.evaluate(closed_df)
+                if signal is None:
+                    continue
+                key = f"{signal.symbol}|{signal.timeframe}|{strat.name}"
+                if state.already_alerted(key, signal.timestamp):
+                    continue
+                signal.strategy = strat.name
+                log.info(f"SIGNAL: {signal.side} {signal.symbol} "
+                         f"{signal.timeframe} @ {signal.price}")
+                tg.send(signal)
+                state.mark_alerted(key, signal.timestamp)
+        except Exception as e:
+            log.error(f"[{symbol} {timeframe}] once-mode error: {e}")
 
 
 def main():
     cfg = load_config()
+
+    # --once mode: one evaluation, then exit (Actions testing / manual runs)
+    if "--once" in sys.argv:
+        tg = TelegramAlert(cfg["alerts"]["telegram"]["bot_token"],
+                           cfg["alerts"]["telegram"]["chat_id"])
+        state = StateStore()
+        evaluate_once(cfg, tg, state)
+        log.info("--once complete — exiting")
+        sys.exit(0)
+
     tg = TelegramAlert(cfg["alerts"]["telegram"]["bot_token"],
                        cfg["alerts"]["telegram"]["chat_id"])
     state = StateStore()
@@ -95,11 +162,27 @@ def main():
         t.start()
         threads.append(t)
 
-    log.info(f"Watching {len(cfg['markets'])} market(s) in parallel")
+    if MAX_RUNTIME_HOURS > 0:
+        log.info(f"Watching {len(cfg['markets'])} market(s) in parallel "
+                 f"(max runtime {MAX_RUNTIME_HOURS}h, MCX session 09:00-23:30 IST)")
+        deadline = time.time() + MAX_RUNTIME_HOURS * 3600
+    else:
+        log.info(f"Watching {len(cfg['markets'])} market(s) in parallel (no runtime limit)")
+        deadline = None
 
     try:
         while True:
-            time.sleep(1)
+            # Session check first: outside MCX hours there is nothing to watch.
+            if not in_mcx_hours():
+                log.info("Outside MCX session (09:00-23:30 IST) — exiting. "
+                         "Next scheduled run will pick up.")
+                break
+            # Runtime ceiling: exit before GitHub's 6h job kill.
+            if deadline is not None and time.time() >= deadline:
+                log.info("Runtime limit reached — shutting down cleanly. "
+                         "Cron will restart us.")
+                break
+            time.sleep(30)
     except KeyboardInterrupt:
         log.info("Stopped by user (Ctrl+C)")
 
