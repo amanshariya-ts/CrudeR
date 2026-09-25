@@ -1,0 +1,28 @@
+fyers:
+  app_id: "B87U7R9BRA-200"
+  access_token_file: "access_token.txt"   # auto-refresh writes here
+
+markets:
+  - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
+    timeframe: "30m"
+    exchange: "fyers"                 # was "yf_oil"
+  - symbol: "MCX:CRUDEOIL26OCTFUT"   # validated live contract
+    timeframe: "1h"
+    exchange: "fyers" 
+
+strategies:
+  - name: liquidity_pinbars
+    enabled: true
+    params:
+      ema_length: 9
+      body_size_ratio: 0.3
+      wick_ratio: 2.0
+
+alerts:
+  telegram:
+    bot_token: "8836956846:AAFL5BEINJ3VhgLc_I4UoSLIj_By1s8Iy9k"
+    chat_id: "1048733397"
+
+polling:
+  interval_seconds: 5
+  lookback_bars: 200
