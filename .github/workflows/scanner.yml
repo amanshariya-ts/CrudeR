@@ -1,1 +1,64 @@
-name: 
+
+# .github/workflows/crude-scanner.yml
+name: crude-scanner
+
+on:
+  workflow_dispatch: {}          # manual "Run workflow" button for testing
+  schedule:
+    # Relaunch safety net — starts inside the MCX session (09:00-23:30 IST).
+    # 3 starts x 5.5h max runtime = full 14.5h session coverage with margin.
+    - cron: "30 3 * * *"         # 09:00 IST — session open
+    - cron: "30 9 * * *"         # 15:00 IST — mid-session relaunch
+    - cron: "0 15 * * *"         # 20:30 IST — evening relaunch
+
+permissions:
+  contents: write
+
+# Never let two pollers overlap (delayed cron + 5.5h runtime can collide).
+concurrency:
+  group: crude-poller
+  cancel-in-progress: true
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # matches GitHub's 6h ceiling; main.py exits at 5.5h
+    env:
+      MAX_RUNTIME_HOURS: "5.5"    # self-exit before the job kill (main.py reads this)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Build config from secrets
+        run: |
+          cat > config.json <<EOF
+          {
+            "app_id": "${{ secrets.FYERS_APP_ID }}",
+            "secret_key": "${{ secrets.FYERS_SECRET_KEY }}",
+            "access_token": "${{ secrets.FYERS_ACCESS_TOKEN }}",
+            "refresh_token": "",
+            "pin": "${{ secrets.FYERS_PIN }}",
+            "exchange": { "name": "fyers" },
+            "markets": [
+              { "symbol": "MCX:CRUDEOIL25AUG", "timeframe": "30m", "exchange": "fyers" }
+            ],
+            "strategies": [
+              { "name": "liquidity_pinbars", "enabled": true, "params": {} }
+            ],
+            "polling": { "lookback_bars": 200 },
+            "alerts": {
+              "telegram": {
+                "bot_token": "${{ secrets.TELEGRAM_BOT_TOKEN }}",
+                "chat_id": "${{ secrets.TELEGRAM_CHAT_ID }}"
+              }
+            }
+          }
+          EOF
+
+      - name: Run live scanner
+        run: python main.py
