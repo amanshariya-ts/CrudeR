@@ -1,1 +1,8 @@
-
+config/config.json
+config.json
+access_token.txt
+*.log
+data/
+state/*.json
+__pycache__/
+*.pyc
