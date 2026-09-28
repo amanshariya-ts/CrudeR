@@ -1,10 +1,14 @@
 # data/fyers_fetcher.py
 import json
-import os
+import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
+
+log = logging.getLogger(__name__)
 
 
 class FyersFetcher:
@@ -14,6 +18,10 @@ class FyersFetcher:
         "1h": "60", "2h": "120", "4h": "240",
         "1d": "D",
     }
+
+    FETCH_TIMEOUT = 20   # hard cap per history() call — a hung call must never eat a candle cycle
+    MAX_ATTEMPTS = 3
+    RETRY_BASE_DELAY = 2  # exponential: 2s, 4s, 8s
 
     def __init__(self, app_id: str, config_path: str, token: str | None = None):
         self.app_id = app_id
@@ -42,6 +50,27 @@ class FyersFetcher:
         return self._client
 
     # ------------------------------------------------------------------ #
+    def _history_with_timeout(self, payload: dict) -> dict:
+        """Run the SDK's blocking history() under a hard timeout.
+
+        The fyers_apiv3 SDK does its own HTTP internally with no timeout we
+        can set — a stalled connection used to block the poll thread for an
+        entire candle cycle. This abandons such calls after FETCH_TIMEOUT.
+        shutdown(wait=False) is critical: a plain `with` block would secretly
+        block on exit waiting for the hung thread, re-creating the bug.
+        """
+        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fyers-fetch")
+        try:
+            fut = ex.submit(self._get_client().history, payload)
+            return fut.result(timeout=self.FETCH_TIMEOUT)
+        except FutureTimeout:
+            raise TimeoutError(
+                f"fyers history() hung >{self.FETCH_TIMEOUT}s — abandoned"
+            )
+        finally:
+            ex.shutdown(wait=False)
+
+    # ------------------------------------------------------------------ #
     def fetch_ohlcv(self, symbol, timeframe, limit=200):
         resolution = self.RESOLUTION_MAP.get(timeframe)
         if resolution is None:
@@ -50,7 +79,10 @@ class FyersFetcher:
         tf_sec = self.timeframe_to_seconds(timeframe)
         end = int(time.time())
         start = end - max(limit * tf_sec * 3, 5 * 86400)
+
+        t0 = time.time()
         resp = self._request_history(symbol, resolution, start, end)
+        log.debug(f"history {symbol} {timeframe} took {time.time()-t0:.1f}s")
 
         if resp.get("s") != "ok":
             raise RuntimeError(f"Fyers history error for {symbol}: {resp}")
@@ -76,16 +108,18 @@ class FyersFetcher:
                    .reset_index(drop=True)).tail(limit).reset_index(drop=True)
 
     # ------------------------------------------------------------------ #
-    def _request_history(self, symbol, resolution, start, end, retries=3):
+    def _request_history(self, symbol, resolution, start, end):
+        """history() with hard timeout + exponential-backoff retry.
+        Token errors raise immediately — retrying an expired token is pointless."""
         payload = {
             "symbol": symbol, "resolution": resolution,
             "date_format": "0", "range_from": str(start),
             "range_to": str(end), "cont_flag": "1",
         }
         last = None
-        for attempt in range(retries):
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
             try:
-                resp = self._get_client().history(payload)   # fresh token check
+                resp = self._history_with_timeout(payload)
                 msg = str(resp.get("message", "")).lower()
                 if resp.get("s") == "error" and (
                     "token" in msg or resp.get("code") in (-15, -16)
@@ -98,8 +132,16 @@ class FyersFetcher:
                 raise
             except Exception as e:
                 last = e
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"Fyers history failed after {retries} tries: {last}")
+                delay = self.RETRY_BASE_DELAY ** attempt
+                log.warning(
+                    f"history attempt {attempt}/{self.MAX_ATTEMPTS} failed "
+                    f"for {symbol} {resolution}: {e} — retrying in {delay}s"
+                )
+                if attempt < self.MAX_ATTEMPTS:
+                    time.sleep(delay)
+        raise RuntimeError(
+            f"Fyers history failed after {self.MAX_ATTEMPTS} tries: {last}"
+        )
 
     # ------------------------------------------------------------------ #
     @staticmethod
