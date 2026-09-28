@@ -16,12 +16,14 @@ MCX_CLOSE_HOUR = 23  # 23:30 IST
 # After a candle closes, the bar may take a moment to appear on Fyers.
 CLOSE_LAG_SECONDS = 10        # first attempt after close
 CLOSE_RETRY_SECONDS = 5       # retry cadence if bar not published yet
-CLOSE_RETRY_MAX = 12          # max ~1 minute of retries, then give up till next close
+CLOSE_RETRY_MAX = 12          # max attempts per boundary
+CLOSE_RETRY_BUDGET = 120      # hard deadline (s) — never drift into next boundary
 
 
 class CandlePoller:
     """Emits each confirmed (closed) candle exactly once.
-    Sleeps until candle boundaries — no fixed-interval API burning."""
+    Sleeps until candle boundaries — no fixed-interval API burning.
+    Catches up any bars missed while a boundary fetch failed."""
 
     def __init__(self, fetcher, symbol: str, timeframe: str,
                  lookback: int = 200):
@@ -57,7 +59,8 @@ class CandlePoller:
 
             # Outside MCX session: idle cheaply, re-check every minute.
             if not self._in_mcx_session(now_utc):
-                log.info(f"Outside MCX session (IST {now_utc.astimezone(IST):%H:%M}) — idling 60s")
+                log.info(f"Outside MCX session "
+                         f"(IST {now_utc.astimezone(IST):%H:%M}) — idling 60s")
                 time.sleep(60)
                 continue
 
@@ -67,40 +70,78 @@ class CandlePoller:
             time.sleep(wait)
 
             # --- Phase 2: fetch with short retries until bar published ----
-            for attempt in range(CLOSE_RETRY_MAX):
-                try:
-                    df = self.fetcher.fetch_ohlcv(self.symbol, self.timeframe,
-                                                  self.lookback)
-                except TokenExpiredError as e:
-                    log.critical(f"Fyers token expired — poller halted. {e}")
-                    raise
-                except Exception as e:
-                    log.error(f"Poll error (attempt {attempt + 1}): {e}")
-                    time.sleep(CLOSE_RETRY_SECONDS)
-                    continue
-
-                closed = df.iloc[:-1]  # drop still-open candle
-                if len(closed):
-                    latest = closed.iloc[-1]
-                    if (self._last_seen_close_ts is None
-                            or latest["timestamp"] > self._last_seen_close_ts):
-                        if self._last_seen_close_ts is not None:  # skip replay
-                            self._log_candle(latest)          # <-- NEW
-                            yield latest, df                  # <-- CHANGED: emit pair
-                        self._last_seen_close_ts = latest["timestamp"]
-                        break
-                time.sleep(CLOSE_RETRY_SECONDS)
-
-            else:
+            df = self._fetch_until_published()
+            if df is None:
                 # All retries exhausted — skip this boundary, aim for next.
-                log.warning(f"No new bar after {CLOSE_RETRY_MAX} retries "
-                            f"— waiting for next close")
+                # The backlog catch-up will emit this bar on a later fetch.
+                continue
+
+            # --- Phase 3: emit newest bar, then catch up any backlog -------
+            closed = df.iloc[:-1]  # drop still-open candle
+            if not len(closed):
+                continue
+
+            newest_ts = closed.iloc[-1]["timestamp"]
+            if self._last_seen_close_ts is None:
+                # First run of the session: seed state without emitting replay.
+                self._last_seen_close_ts = newest_ts
+                log.info(f"Seeded last-seen bar: {newest_ts}")
+                continue
+
+            if newest_ts <= self._last_seen_close_ts:
+                continue  # nothing new
+
+            # Emit every unseen closed bar, oldest → newest.
+            mask = closed["timestamp"] > self._last_seen_close_ts
+            for _, bar in closed[mask].iterrows():
+                self._log_candle(bar)
+                yield bar, df
+            self._last_seen_close_ts = newest_ts
 
             # Small settle time so boundary math doesn't double-fire
             time.sleep(1)
 
     # ------------------------------------------------------------------ #
-    def _log_candle(self, bar: pd.Series) -> None:                # <-- NEW
+    def _fetch_until_published(self) -> pd.DataFrame | None:
+        """Fetch repeatedly until the closed bar appears, or budget runs out.
+        Returns the dataframe, or None if this boundary should be skipped."""
+        deadline = time.monotonic() + CLOSE_RETRY_BUDGET
+        for attempt in range(1, CLOSE_RETRY_MAX + 1):
+            try:
+                df = self.fetcher.fetch_ohlcv(self.symbol, self.timeframe,
+                                              self.lookback)
+            except TokenExpiredError as e:
+                log.critical(f"Fyers token expired — poller halted. {e}")
+                raise
+            except Exception as e:
+                log.error(f"Poll error (attempt {attempt}/{CLOSE_RETRY_MAX}): {e}")
+                if (time.monotonic() + CLOSE_RETRY_SECONDS >= deadline
+                        or attempt == CLOSE_RETRY_MAX):
+                    log.warning(f"No new bar after {attempt} retries "
+                                f"— waiting for next close (backlog will catch up)")
+                    return None
+                time.sleep(CLOSE_RETRY_SECONDS)
+                continue
+
+            closed = df.iloc[:-1]
+            if len(closed) and (
+                self._last_seen_close_ts is None
+                or closed.iloc[-1]["timestamp"] > self._last_seen_close_ts
+            ):
+                return df
+
+            # Bar not published yet (or no new bar) — retry shortly.
+            if (time.monotonic() + CLOSE_RETRY_SECONDS >= deadline
+                    or attempt == CLOSE_RETRY_MAX):
+                log.warning(f"No new bar after {attempt} attempts within budget "
+                            f"— waiting for next close (backlog will catch up)")
+                return None
+            time.sleep(CLOSE_RETRY_SECONDS)
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    def _log_candle(self, bar: pd.Series) -> None:
         """Log emitted candle OHLC + IST timestamp for TradingView cross-check."""
         ts = bar["timestamp"]
         # Normalize to IST whether ts is tz-aware UTC or tz-naive epoch-based
