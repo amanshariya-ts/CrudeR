@@ -1,34 +1,44 @@
 # alerts/telegram.py
-import requests
 import logging
+
+import requests
 
 log = logging.getLogger(__name__)
 
+
 class TelegramAlert:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.url = f"https://api.telegram.org/bot8948292694:AAHVSAqtxeJuRoTQecwMpB6n1kh08kuSaOo/sendMessage"
-        self.chat_id = 1048733397
+    """Sends alerts to Telegram via Bot API."""
 
-    def send(self, signal) -> None:
-        ts = signal.timestamp.strftime("%Y-%m-%d %H:%M UTC")
-        if signal.side == "BUY":
-            header = "🟢 BUY — Bullish Liquidity"
-        else:
-            header = "🔴 SELL — Bearish Liquidity"
+    def __init__(self, bot_token: str = "", chat_id: str = ""):
+        self.bot_token = bot_token or ""
+        self.chat_id = chat_id or ""
 
-        msg = (
-            f"{header}\n"
-            f"Symbol: {signal.symbol}\n"
-            f"Timeframe: {signal.timeframe}\n"
-              )
+    def send_text(self, text: str) -> bool:
+        """Send a plain text message. Returns True on success."""
+        if not self.bot_token or not self.chat_id:
+            log.warning("Telegram not configured — skipping send")
+            return False
         try:
-            r = requests.post(self.url, json={
-                "chat_id": self.chat_id,
-                "text": msg,
-            }, timeout=10)
-            r.raise_for_status()
+            resp = requests.post(
+                "https://api.telegram.org/bot" + self.bot_token + "/sendMessage",
+                json={"chat_id": self.chat_id, "text": text},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return True
+            log.warning("Telegram HTTP %s: %s", resp.status_code, resp.text[:200])
+            return False
         except Exception as e:
-            log.error(f"Telegram send failed: {e}")
+            log.warning("Telegram send failed: %s", e)
+            return False
 
-        # send() is only ever called with a real Signal object.
-        # "No signal" bars return None in the strategy and never get here.
+    def send(self, signal) -> bool:
+        """Send a formatted message for a signal object."""
+        arrow = "🟢 BUY CrudeR" if signal.side.upper() == "BUY" else "🔴 SELL CrudeR"
+        text = arrow + " pinbar — " + signal.symbol + " [" + signal.timeframe + "]"
+        if getattr(signal, "exchange", ""):
+            text += " @ " + signal.exchange
+        text += "\nPrice: " + f"{signal.price:.2f}"
+        if getattr(signal, "strategy", ""):
+            text += "\nStrategy: " + signal.strategy
+        return self.send_text(text)
