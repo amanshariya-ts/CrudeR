@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from config.config_loader import load_config
 from data.fetcher import create_fetcher
 from data.candle_poller import CandlePoller
-from data.fyers_fetcher import TokenExpiredError
+from data.fyers_fetcher import FyersFetcher, TokenExpiredError
 from strategies.liquidity_pinbars import LiquidityPinBars
 from alerts.telegram import TelegramAlert
 from state.state_store import StateStore
@@ -56,6 +56,26 @@ def build_strategies(symbol, timeframe, strategy_cfgs):
     return strategies
 
 
+# ---------------------------------------------------------------------------
+# Shared signal evaluation — used by BOTH the loop path and --once path,
+# so dedupe/alert logic can never drift between the two.
+# ---------------------------------------------------------------------------
+def process_candles(strategies, closed_df, state, tg, symbol, timeframe):
+    """Evaluate all strategies against closed candles; alert on new signals."""
+    for strat in strategies:
+        signal = strat.evaluate(closed_df)
+        if signal is None:
+            continue
+        key = f"{signal.symbol}|{signal.timeframe}|{strat.name}"
+        if state.already_alerted(key, signal.timestamp):
+            continue
+        signal.strategy = strat.name
+        log.info(f"SIGNAL: {signal.side} {signal.symbol} "
+                 f"{signal.timeframe} @ {signal.price}")
+        tg.send(signal)
+        state.mark_alerted(key, signal.timestamp)
+
+
 def run_market(cfg, tg, state, symbol, timeframe, exchange_name):
     """One watcher per symbol+timeframe. Own thread, own fetcher."""
     try:
@@ -76,20 +96,15 @@ def run_market(cfg, tg, state, symbol, timeframe, exchange_name):
     try:
         # Poller yields (closed_candle, full_df) — one API call per candle close.
         for candle, df in poller.poll_forever():
+            # Stop wasting API calls once the session is over; the supervisor
+            # exits the process, but this keeps threads quiet at the boundary.
+            if not in_mcx_hours():
+                log.info(f"[{symbol}] session over — thread idling down")
+                return
+
             try:
                 closed_df = df.iloc[:-1]  # drop still-open candle — free, local
-                for strat in strategies:
-                    signal = strat.evaluate(closed_df)
-                    if signal is None:
-                        continue
-                    key = f"{signal.symbol}|{signal.timeframe}|{strat.name}"
-                    if state.already_alerted(key, signal.timestamp):
-                        continue
-                    signal.strategy = strat.name
-                    log.info(f"SIGNAL: {signal.side} {signal.symbol} "
-                             f"{signal.timeframe} @ {signal.price}")
-                    tg.send(signal)
-                    state.mark_alerted(key, signal.timestamp)
+                process_candles(strategies, closed_df, state, tg, symbol, timeframe)
             except Exception as e:
                 log.error(f"[{symbol} {timeframe}] eval error: {e}")
 
@@ -102,9 +117,7 @@ def run_market(cfg, tg, state, symbol, timeframe, exchange_name):
 
 
 def evaluate_once(cfg, tg, state):
-    """Single evaluation pass over all markets — used by --once mode.
-    Fetches each market's latest candles, drops the forming candle,
-    and evaluates strategies exactly like the loop path does."""
+    """Single evaluation pass over all markets — used by --once mode."""
     for market in cfg["markets"]:
         symbol = market["symbol"]
         timeframe = market["timeframe"]
@@ -116,41 +129,62 @@ def evaluate_once(cfg, tg, state):
             df = fetcher.fetch_ohlcv(symbol, timeframe,
                                      cfg["polling"]["lookback_bars"])
             closed_df = df.iloc[:-1]
-            for strat in build_strategies(symbol, timeframe, cfg["strategies"]):
-                signal = strat.evaluate(closed_df)
-                if signal is None:
-                    continue
-                key = f"{signal.symbol}|{signal.timeframe}|{strat.name}"
-                if state.already_alerted(key, signal.timestamp):
-                    continue
-                signal.strategy = strat.name
-                log.info(f"SIGNAL: {signal.side} {signal.symbol} "
-                         f"{signal.timeframe} @ {signal.price}")
-                tg.send(signal)
-                state.mark_alerted(key, signal.timestamp)
+            strategies = build_strategies(symbol, timeframe, cfg["strategies"])
+            process_candles(strategies, closed_df, state, tg, symbol, timeframe)
         except Exception as e:
             log.error(f"[{symbol} {timeframe}] once-mode error: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Startup checks — fail fast (seconds, not hours)
+# ---------------------------------------------------------------------------
+def auth_smoke_test(exchange_name):
+    """Verify credentials are alive BEFORE burning the run.
+    A dead token fails here in ~30s; without this check it would surface
+    in each thread on the first candle close, after an unknown delay."""
+    if exchange_name != "fyers":
+        return
+    try:
+        FyersFetcher().ping()
+    except TokenExpiredError:
+        log.critical("Auth smoke test failed: token expired/invalid — "
+                     "run refresh_token.py, then restart.")
+        os._exit(1)
+    except Exception as e:
+        # Network hiccup at startup shouldn't kill the run — the per-call
+        # retry logic in the fetcher will handle transient issues later.
+        log.warning(f"Auth smoke test could not complete: {e} — continuing")
+
+
+def get_telegram(cfg):
+    """Single validation point for alert config — clear error, not a KeyError
+    from deep inside a thread's first signal."""
+    try:
+        tcfg = cfg["alerts"]["telegram"]
+        return TelegramAlert(tcfg["bot_token"], tcfg["chat_id"])
+    except (KeyError, TypeError):
+        log.critical("alerts.telegram.bot_token / chat_id missing from config — halting")
+        os._exit(1)
+
+
 def main():
     cfg = load_config()
+    tg = get_telegram(cfg)
+    state = StateStore()
+
+    default_exchange = cfg.get("exchange", {}).get("name", "fyers")
 
     # --once mode: one evaluation, then exit (Actions testing / manual runs)
     if "--once" in sys.argv:
-        tg = TelegramAlert(cfg["alerts"]["telegram"]["bot_token"],
-                           cfg["alerts"]["telegram"]["chat_id"])
-        state = StateStore()
         evaluate_once(cfg, tg, state)
         log.info("--once complete — exiting")
         sys.exit(0)
 
-    tg = TelegramAlert(cfg["alerts"]["telegram"]["bot_token"],
-                       cfg["alerts"]["telegram"]["chat_id"])
-    state = StateStore()
+    # Fail fast on dead credentials before spawning anything.
+    auth_smoke_test(default_exchange)
 
     threads = []
     for market in cfg["markets"]:
-        default_exchange = cfg.get("exchange", {}).get("name", "fyers")
         exchange_name = market.get("exchange", default_exchange)
 
         t = threading.Thread(
@@ -158,6 +192,7 @@ def main():
             args=(cfg, tg, state,
                   market["symbol"], market["timeframe"], exchange_name),
             daemon=True,
+            name=f"watch-{market['symbol']}-{market['timeframe']}",
         )
         t.start()
         threads.append(t)
@@ -171,7 +206,7 @@ def main():
         deadline = None
 
     try:
-        while True:
+        while any(t.is_alive() for t in threads):
             # Session check first: outside MCX hours there is nothing to watch.
             if not in_mcx_hours():
                 log.info("Outside MCX session (09:00-23:30 IST) — exiting. "
