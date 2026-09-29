@@ -1,0 +1,11 @@
+{
+  "exchange": { "name": "fyers" },
+  "markets": [
+    { "symbol": "MCX:CRUDEOIL25AUG", "timeframe": "30m", "exchange": "fyers" }
+  ],
+  "strategies": [
+    { "name": "liquidity_pinbars", "enabled": true, "params": {} }
+  ],
+  "polling": { "lookback_bars": 200 },
+  "alerts": { "telegram": { "enabled": true } }
+}
