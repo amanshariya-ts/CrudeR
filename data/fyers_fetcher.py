@@ -1,6 +1,7 @@
 # data/fyers_fetcher.py
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
@@ -23,22 +24,62 @@ class FyersFetcher:
     MAX_ATTEMPTS = 3
     RETRY_BASE_DELAY = 2  # exponential: 2s, 4s, 8s
 
-    def __init__(self, app_id: str, config_path: str, token: str | None = None):
-        self.app_id = app_id
+    # Token resolution order (first non-empty wins):
+    #   1. explicit `token` arg        — tests
+    #   2. FYERS_ACCESS_TOKEN env var  — GitHub Actions (never touches disk)
+    #   3. config.json fallback        — local dev only (file is gitignored)
+    TOKEN_ENV_VAR = "FYERS_ACCESS_TOKEN"
+
+    def __init__(
+        self,
+        app_id: str | None = None,
+        config_path: str = "config.json",
+        token: str | None = None,
+    ):
+        # app_id: env-first too, so main.py can simply do FyersFetcher()
+        self.app_id = app_id or os.environ.get("FYERS_APP_ID", "").strip()
+        if not self.app_id:
+            raise RuntimeError(
+                "Fyers app_id missing — set FYERS_APP_ID env var "
+                "(or pass app_id= explicitly)"
+            )
+
         self.config_path = config_path
         self._injected_token = token   # tests only
         self._client = None
         self._token_used: str | None = None
 
     # ------------------------------------------------------------------ #
-    def _get_client(self):
-        """Return a Fyers client bound to the CURRENT token in config.json.
-        Rebuilds the client only when the token actually changed."""
+    def _resolve_token(self) -> str:
+        """Resolve the access token without depending on config.json."""
+        # 1. Explicit injection (tests)
         if self._injected_token is not None:
-            token = self._injected_token
-        else:
+            return self._injected_token.strip()
+
+        # 2. Environment (GitHub Actions / local export)
+        env_token = os.environ.get(self.TOKEN_ENV_VAR, "").strip()
+        if env_token:
+            return env_token
+
+        # 3. Local file fallback (gitignored, local dev only)
+        if os.path.exists(self.config_path):
             with open(self.config_path) as f:
-                token = json.load(f)["access_token"].strip()
+                token = str(json.load(f).get("access_token", "")).strip()
+            if token:
+                log.debug("Token loaded from %s (local fallback)", self.config_path)
+                return token
+
+        raise RuntimeError(
+            f"Fyers access token not found — set {self.TOKEN_ENV_VAR} env var, "
+            f"pass token= explicitly, or provide {self.config_path} (local only)"
+        )
+
+    def _get_client(self):
+        """Return a Fyers client bound to the CURRENT token.
+        Rebuilds the client only when the token actually changed — so a
+        hot-reloaded token (refresh_token.py rewriting config.json/env)
+        is picked up mid-session without restart."""
+        token = self._resolve_token()
         if not token:
             raise RuntimeError("Fyers access token is empty — run refresh_token.py")
 
@@ -47,7 +88,33 @@ class FyersFetcher:
                 client_id=self.app_id, is_async=False, token=token, log_path=""
             )
             self._token_used = token
+            log.info("Fyers client ready (token ...%s)", token[-6:])
         return self._client
+
+    # ------------------------------------------------------------------ #
+    def ping(self) -> bool:
+        """Lightweight authenticated call for startup smoke tests.
+        Raises on auth failure so the workflow fails fast (30s) instead of
+        burning a 5.5h run with dead credentials."""
+        resp = self._history_with_timeout({
+            "symbol": "MCX:CRUDEOIL25AUG",
+            "resolution": "1",
+            "date_format": "0",
+            "range_from": str(int(time.time()) - 3600),
+            "range_to": str(int(time.time())),
+            "cont_flag": "1",
+        })
+        msg = str(resp.get("message", "")).lower()
+        if resp.get("s") == "error" and (
+            "token" in msg or resp.get("code") in (-15, -16)
+        ):
+            raise TokenExpiredError(
+                "Auth smoke test failed — token expired/invalid"
+            )
+        if resp.get("s") != "ok":
+            raise RuntimeError(f"Auth smoke test failed: {resp}")
+        log.info("Auth smoke test passed")
+        return True
 
     # ------------------------------------------------------------------ #
     def _history_with_timeout(self, payload: dict) -> dict:
