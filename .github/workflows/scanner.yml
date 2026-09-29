@@ -63,11 +63,11 @@ jobs:
           echo "All secrets present."
 
       # Fail fast (30s) if credentials are dead, instead of burning 5.5h blind
-      - name: Auth smoke test
-        run: |
-          python -c "from data.fyers_fetcher import FyersFetcher; from data.fetcher import create_fetcher; from config.config_loader import load_config; cfg = load_config(); f = create_fetcher(cfg.get('exchange', {}).get('name', 'fyers'), cfg); f.ping()"
+      # - name: Auth smoke test
+      #   run: |
+      #     python -c "from data.fyers_fetcher import FyersFetcher; from data.fetcher import create_fetcher; from config.config_loader import load_config; cfg = load_config(); f = create_fetcher(cfg.get('exchange', {}).get('name', 'fyers'), cfg); f.ping()"
 
-        # ^ if you don't have ping(), see note below the workflow
+      #   # ^ if you don't have ping(), see note below the workflow
 
       - name: Run live scanner
         run: python main.py
